@@ -255,6 +255,16 @@ Following AxBench (Wu et al., 2025):
 2. **Judge.** GPT-4o-mini scores each generation on Concept ($C$), Instruction-following ($I$), and Fluency ($F$), each in $\{0, 1, 2\}$.
 3. **Aggregate.** Per-factor max with prompt-level 50/50 split: pick the best $T$ per concept on "train" prompts, report HMean = $3 / (1/C + 1/I + 1/F)$ on "test" prompts.
 
+## Inverse Semantic Transport (experimental)
+
+`flas.ist` extends FLAS from steering to *explanation*: given two responses to
+the same prompt, a differentiable sparse solver finds the natural-language
+concept transports (and strengths) that best account for the difference, and
+validates each explanation causally by applying it back during generation. It
+also adds graded strength↔flow-time training so that flow time is supervised
+as concept intensity. See [docs/IST.md](docs/IST.md) for the full pipeline
+(graded data construction → training → inverse explanation → causal eval).
+
 ## Project layout
 
 ```
@@ -263,10 +273,22 @@ flas/
 │   ├── model.py          # multi-family registry + FlowBlock / FlowFunction / ConceptEncoder
 │   ├── train.py          # PyTorch Lightning training
 │   ├── generate.py       # batched steered generation
+│   └── ist/              # Inverse Semantic Transport (see docs/IST.md)
+│       ├── inverse.py            # TransportMixture + sparse/greedy inverse solvers
+│       ├── activations.py        # layer-l activation extraction + distances
+│       ├── mixture_generate.py   # multi-concept steered generation
+│       ├── train_graded.py       # graded strength<->flow-time training
+│       └── openai_utils.py       # shared OpenAI plumbing (strength judge)
 ├── scripts/
 │   ├── eval.py           # AxBench-aligned generation
 │   ├── judge_openai.py   # GPT-4o-mini judge (OpenAI)
-│   └── chat.py           # interactive CLI
+│   ├── chat.py           # interactive CLI
+│   ├── ist_build_graded_data.py   # graded concept-strength ladders
+│   ├── ist_make_synthetic_pairs.py# known-edit ground-truth pairs
+│   ├── ist_explain.py             # inverse sparse-transport explanations
+│   └── ist_causal_eval.py         # causal validation of explanations
+├── tests/
+│   └── test_ist_smoke.py # CPU-only IST smoke tests
 ├── pyproject.toml
 ├── LICENSE
 └── README.md

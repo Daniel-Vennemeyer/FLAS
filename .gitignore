@@ -23,6 +23,7 @@ data/*
 !data/eval_c16k_2b_ho100.json
 !data/eval_c16k_9b_hi100.json
 !data/eval_c16k_9b_ho100.json
+!data/ist_concept_bank.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
