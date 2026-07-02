@@ -13,5 +13,6 @@ from flas.ist.activations import (
     extract_layer_activations, activation_distance, masked_mean)
 from flas.ist.inverse import (
     TransportMixture, bank_displacements, generic_direction, shared_subspace,
-    solve_sparse, solve_greedy, steered_nll, warm_start_alphas)
+    solve_sparse, solve_greedy, solve_nll, solve_nll_ids, steered_nll,
+    warm_start_alphas)
 from flas.ist.mixture_generate import MixtureFlasGenerator, load_mixture_generator

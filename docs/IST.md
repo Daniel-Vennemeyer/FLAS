@@ -81,8 +81,18 @@ D( pool(Φ_α(h_a)), pool(h_b) ) / D_0  +  λ · Σ α_i
   hard-threshold + refit). This is the primary method.
 - **`solve_greedy`**: grid-search baseline — repeatedly add the
   (concept, strength) pair that most reduces the distance.
-- **`steered_nll`**: behavioral reconstruction — NLL of `y_b` under the
-  frozen LM with the inferred transport applied vs. unsteered.
+- **`solve_nll`** (`--method nll`): the token-level behavioral inverse —
+  optimize α directly against the teacher-forced NLL of `y_b` under the
+  frozen LM with the transport applied. Teacher forcing makes the objective
+  per-position and alignment-free (no pooling, no cross-sequence matching),
+  so it fully exercises the flow's per-token expressivity. Warm-started from
+  the activation-space scores. Note: Δ-NLL verification is in-sample for
+  this method — validate via ground-truth recovery and the causal eval.
+- **`steered_nll`**: behavioral reconstruction/verification — NLL of `y_b`
+  under the frozen LM with the inferred transport applied vs. unsteered.
+  Explanations whose transport does not raise `y_b`'s likelihood by
+  `--verify-dnll` are flagged REJECTED (activation-space matching proposes,
+  behavioral reconstruction disposes).
 
 Reported per pair: **explained fraction** `1 − D_final/D_0`, **Δ-NLL**, and
 **seed stability** (Jaccard of supports across solver seeds — the diagnostic

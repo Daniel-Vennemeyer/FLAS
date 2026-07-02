@@ -54,7 +54,8 @@ def main():
     parser.add_argument("--num-blocks", type=int, default=None)
     parser.add_argument("--explanations-file", type=str, required=True,
                         help="Output of ist_explain.py")
-    parser.add_argument("--method", choices=["sparse", "greedy"], default="sparse")
+    parser.add_argument("--method", choices=["sparse", "greedy", "nll"],
+                        default="sparse")
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--n-steps", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=256)

@@ -384,6 +384,103 @@ def solve_greedy(mixture, h_a, mask_a, h_b, mask_b,
         explained_fraction=1.0 - d_cur / d0)
 
 
+def solve_nll(llm, tokenizer, layer, mixture, prompt, target,
+              concept_hidden, concept_mask, *, prompt_format="chat",
+              max_len=1024, l1_weight=0.05, iters=100, lr=0.1,
+              alpha_max=4.0, init_alphas=None, alpha_init=0.1,
+              threshold=0.05, seed=0, verbose=False):
+    """Behavioral inverse: optimize alphas directly against the teacher-forced
+    NLL of `target` under the frozen LM with the mixture transport applied.
+
+    This is the token-level objective: teacher forcing scores every position
+    of y_b against its actual next token (no cross-sequence alignment needed),
+    and the transport inside the hook is evaluated per position — pooled
+    activation matching discards both. Gradients flow from the LM loss through
+    the frozen layers above `layer` into alphas only. d0/d_final in the result
+    are the unsteered/steered NLL, so explained_fraction is the relative NLL
+    reduction; note delta-NLL verification is in-sample for this method —
+    validate with ground-truth recovery or the causal eval instead."""
+    full_ids, prompt_len = encode_prompt_response(
+        tokenizer, prompt, target, prompt_format, max_len)
+    device = next(llm.parameters()).device
+    input_ids = torch.tensor([full_ids], dtype=torch.long, device=device)
+    labels = input_ids.clone()
+    labels[0, :prompt_len] = -100
+    return solve_nll_ids(
+        llm, layer, mixture, input_ids, labels, concept_hidden, concept_mask,
+        l1_weight=l1_weight, iters=iters, lr=lr, alpha_max=alpha_max,
+        init_alphas=init_alphas, alpha_init=alpha_init, threshold=threshold,
+        seed=seed, verbose=verbose)
+
+
+def solve_nll_ids(llm, layer, mixture, input_ids, labels,
+                  concept_hidden, concept_mask, *, l1_weight=0.05, iters=100,
+                  lr=0.1, alpha_max=4.0, init_alphas=None, alpha_init=0.1,
+                  threshold=0.05, seed=0, verbose=False):
+    """Tokenized-input core of solve_nll (separated for testability)."""
+    device = input_ids.device
+    m_total = concept_hidden.size(0)
+
+    with torch.no_grad():
+        nll0 = llm(input_ids=input_ids, labels=labels).loss.item()
+
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    if init_alphas is None:
+        alpha0 = torch.full((m_total,), alpha_init, device=device)
+    else:
+        alpha0 = init_alphas.to(device).float()
+    alpha0 = alpha0.clamp(min=1e-3, max=0.9 * alpha_max)
+    rho = torch.log(alpha0 / (alpha_max - alpha0))
+    rho += 0.01 * torch.randn(m_total, generator=gen).to(device)
+    rho.requires_grad_(True)
+    opt = torch.optim.Adam([rho], lr=lr)
+
+    state = {"alphas": None}
+
+    def hook(module, inputs, output):
+        is_tuple = isinstance(output, tuple)
+        h_orig = output[0] if is_tuple else output
+        h = mixture.transport(
+            h_orig.float(), concept_hidden, concept_mask, state["alphas"])
+        h_out = h.to(h_orig.dtype)
+        return (h_out,) + output[1:] if is_tuple else h_out
+
+    handle = get_text_decoder(llm).layers[layer].register_forward_hook(hook)
+    history = []
+    try:
+        for it in range(iters):
+            opt.zero_grad()
+            alphas = alpha_max * torch.sigmoid(rho)
+            state["alphas"] = alphas
+            out = llm(input_ids=input_ids, labels=labels)
+            loss = out.loss + l1_weight * alphas.sum()
+            loss.backward()
+            opt.step()
+            history.append(float(loss.detach()))
+            if verbose and (it % 20 == 0 or it == iters - 1):
+                print(f"    iter {it:4d}  nll={float(out.loss.detach()):.4f}  "
+                      f"|alpha|_1={float(alphas.detach().sum()):.3f}")
+
+        with torch.no_grad():
+            alphas = alpha_max * torch.sigmoid(rho)
+            alphas = torch.where(alphas >= threshold, alphas,
+                                 torch.zeros_like(alphas)).detach()
+            state["alphas"] = alphas
+            if torch.any(alphas > 0):
+                nll_final = llm(input_ids=input_ids, labels=labels).loss.item()
+            else:
+                nll_final = nll0
+    finally:
+        handle.remove()
+
+    return SolveResult(
+        alphas=alphas,
+        support=sorted(torch.nonzero(alphas).flatten().tolist()),
+        d0=nll0, d_final=nll_final,
+        explained_fraction=1.0 - nll_final / max(nll0, 1e-8),
+        history=history)
+
+
 @torch.no_grad()
 def steered_nll(llm, tokenizer, layer, mixture, prompt, target,
                 concept_hidden, concept_mask, alphas,

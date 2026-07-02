@@ -15,18 +15,22 @@ from flas.model import FlowFunction
 from flas.ist.activations import activation_distance, masked_mean
 from flas.ist.inverse import (
     TransportMixture, bank_displacements, generic_direction, shared_subspace,
-    solve_greedy, solve_sparse, warm_start_alphas)
+    solve_greedy, solve_nll_ids, solve_sparse, warm_start_alphas)
 
 torch.manual_seed(0)
 
 D, S, M, L, N = 64, 12, 6, 5, 2
 
 
-def tiny_flow():
-    config = Gemma2Config(
+def tiny_config():
+    return Gemma2Config(
         vocab_size=256, hidden_size=D, intermediate_size=2 * D,
         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
         head_dim=16)
+
+
+def tiny_flow():
+    config = tiny_config()
     flow = FlowFunction(config, num_blocks=1, time_conditioned=True)
     # Zero-init time-MLP makes the flow time-invariant; perturb so t matters.
     with torch.no_grad():
@@ -228,6 +232,39 @@ def test_warm_started_recovery():
         f"warm-started solver found none of the planted concepts (top2={top2})"
 
 
+def test_solve_nll_ids_mechanics():
+    """Behavioral solve on a tiny random LM: gradients must flow from the LM
+    loss through the frozen layers above the hook into alphas."""
+    from transformers.models.gemma2 import Gemma2ForCausalLM
+    llm = Gemma2ForCausalLM(tiny_config()).float().eval()
+    for p in llm.parameters():
+        p.requires_grad_(False)
+    flow = tiny_flow()
+    for p in flow.parameters():
+        p.requires_grad_(False)
+    mixture = TransportMixture(flow, n_steps=N)
+
+    input_ids = torch.randint(0, 256, (1, 16))
+    labels = input_ids.clone()
+    labels[0, :4] = -100
+    ch, cm = torch.randn(M, L, D), torch.ones(M, L)
+
+    init = torch.full((M,), 0.3)
+    res = solve_nll_ids(llm, 0, mixture, input_ids, labels, ch, cm,
+                        iters=5, lr=0.2, l1_weight=0.01, threshold=0.0,
+                        init_alphas=init, seed=0)
+    assert res.alphas.shape == (M,)
+    assert len(res.history) == 5
+    assert all(torch.isfinite(torch.tensor(res.history)))
+    assert torch.isfinite(torch.tensor([res.d0, res.d_final])).all()
+    assert not torch.allclose(res.alphas, init, atol=1e-3), \
+        "optimizer did not move alphas — gradient not flowing through the LM"
+    # Hook must be removed afterward: a fresh forward is unaffected by alphas.
+    with torch.no_grad():
+        nll_clean = llm(input_ids=input_ids, labels=labels).loss.item()
+    assert abs(nll_clean - res.d0) < 1e-4
+
+
 def test_greedy_recovery():
     flow = tiny_flow()
     mixture, h_a, mask, h_b, ch, cm, alphas_true = make_problem(flow)
@@ -248,7 +285,8 @@ if __name__ == "__main__":
                test_shared_subspace_basis,
                test_deflated_recovery_under_generic_confound,
                test_sparse_recovery, test_sparse_recovery_proj,
-               test_warm_started_recovery, test_greedy_recovery]:
+               test_warm_started_recovery, test_solve_nll_ids_mechanics,
+               test_greedy_recovery]:
         print(f"{fn.__name__} ...")
         fn()
         print(f"{fn.__name__} PASSED\n")

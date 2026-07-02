@@ -36,7 +36,7 @@ from flas.generate import load_generator
 from flas.ist.activations import extract_layer_activations
 from flas.ist.inverse import (
     TransportMixture, bank_displacements, shared_subspace, solve_greedy,
-    solve_sparse, steered_nll, warm_start_alphas)
+    solve_nll, solve_sparse, steered_nll, warm_start_alphas)
 
 
 def load_bank(path):
@@ -99,8 +99,17 @@ def main():
     parser.add_argument("--pairs-file", type=str, required=True)
     parser.add_argument("--concept-bank", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--method", choices=["sparse", "greedy", "both"],
-                        default="sparse")
+    parser.add_argument("--method",
+                        choices=["sparse", "greedy", "nll", "both", "all"],
+                        default="sparse",
+                        help="sparse/greedy: activation-space (proj metric). "
+                             "nll: behavioral — optimize alphas against the "
+                             "teacher-forced NLL of y_b (token-level, "
+                             "alignment-free; delta-NLL verification is "
+                             "in-sample for this method). both = sparse+"
+                             "greedy; all = all three.")
+    parser.add_argument("--nll-iters", type=int, default=100,
+                        help="nll method: optimizer iterations")
     parser.add_argument("--distance", choices=["proj", "mean_l2", "mmd"],
                         default="proj",
                         help="proj (default): penalize only the residual along "
@@ -225,7 +234,7 @@ def main():
                 None, concept_hidden, concept_mask, init_alphas)
 
         solutions = {}
-        if args.method in ("sparse", "both"):
+        if args.method in ("sparse", "both", "all"):
             per_seed = []
             for seed in range(args.seeds):
                 res = solve_sparse(
@@ -250,7 +259,7 @@ def main():
                     jaccard(a.support, b.support)
                     for a, b in itertools.combinations(per_seed, 2)]))
             solutions["sparse"] = (canonical, stability)
-        if args.method in ("greedy", "both"):
+        if args.method in ("greedy", "both", "all"):
             res = solve_greedy(
                 mixture, h_a, mask_a, h_b, mask_b,
                 concept_hidden, concept_mask, distance=args.distance,
@@ -258,6 +267,20 @@ def main():
                 max_k=args.greedy_max_k,
                 min_rel_improve=args.greedy_min_improve)
             solutions["greedy"] = (res, None)
+        if args.method in ("nll", "all"):
+            res = solve_nll(
+                llm, tokenizer, layer, mixture, pair["prompt"],
+                pair["response_b"], ch_s, cm_s,
+                prompt_format=prompt_format, max_len=args.max_len,
+                l1_weight=args.l1_weight, iters=args.nll_iters, lr=args.lr,
+                alpha_max=args.alpha_max, init_alphas=init_s,
+                threshold=args.threshold, seed=0)
+            if active_idx is not None:
+                full = torch.zeros(len(bank), device=res.alphas.device)
+                full[active_idx] = res.alphas
+                res.alphas = full
+                res.support = sorted(torch.nonzero(full).flatten().tolist())
+            solutions["nll"] = (res, None)
 
         for name, (res, stability) in solutions.items():
             explanation = sorted(
@@ -300,7 +323,7 @@ def main():
 
     # Aggregate
     summary = {"n_pairs": len(results)}
-    for name in ("sparse", "greedy"):
+    for name in ("sparse", "greedy", "nll"):
         rows = [r[name] for r in results if name in r]
         if not rows:
             continue
