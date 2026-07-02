@@ -119,6 +119,30 @@ def test_sparse_recovery():
         f"top-2 recovered concepts {top2} != planted {true_support}"
 
 
+def test_sparse_recovery_proj():
+    """proj distance must also recover a planted transport, including when the
+    planted displacement is small relative to an unrelated content offset in
+    h_b (the regime where mean_l2 fails on real pairs)."""
+    flow = tiny_flow()
+    for p in flow.parameters():
+        p.requires_grad_(False)
+    mixture, h_a, mask, h_b, ch, cm, alphas_true = make_problem(flow)
+    # Add a content offset orthogonal-ish to the planted displacement on the
+    # response positions of h_b.
+    h_b = h_b + 0.05 * torch.randn(1, S, D) * mask.unsqueeze(-1)
+
+    res = solve_sparse(
+        mixture, h_a, mask, h_b, mask, ch, cm,
+        distance="proj", orth_weight=0.1, l1_weight=0.01,
+        iters=250, lr=0.15, alpha_max=4.0, threshold=0.1, seed=0)
+    print(f"  proj EF={res.explained_fraction:.3f}  support={res.support}")
+    true_support = set(torch.nonzero(alphas_true).flatten().tolist())
+    top2 = set(torch.topk(res.alphas, 2).indices.tolist())
+    assert res.explained_fraction > 0.3
+    assert top2 & true_support, \
+        f"proj solver found none of the planted concepts (top2={top2})"
+
+
 def test_greedy_recovery():
     flow = tiny_flow()
     mixture, h_a, mask, h_b, ch, cm, alphas_true = make_problem(flow)
@@ -135,7 +159,8 @@ def test_greedy_recovery():
 if __name__ == "__main__":
     for fn in [test_transport_shapes_and_identity, test_chunking_equivalence,
                test_gradient_flows_to_alphas, test_distances,
-               test_sparse_recovery, test_greedy_recovery]:
+               test_sparse_recovery, test_sparse_recovery_proj,
+               test_greedy_recovery]:
         print(f"{fn.__name__} ...")
         fn()
         print(f"{fn.__name__} PASSED\n")

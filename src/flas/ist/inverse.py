@@ -89,8 +89,38 @@ class SolveResult:
     history: List[float] = field(default_factory=list)
 
 
-def _distance_fn(kind, h_b, mask_b):
-    """Bind the target side; returns f(h, mask) -> scalar distance."""
+def _distance_fn(kind, h_b, mask_b, h_a=None, mask_a=None, orth_weight=0.1):
+    """Bind the target side; returns f(h, mask) -> scalar distance.
+
+    kind="proj" decomposes the residual pool(h) - pool(h_b) into its component
+    along u = unit(pool(h_b) - pool(h_a)) and the orthogonal remainder, and
+    weights the orthogonal part by `orth_weight`:
+
+        d = (<r, u>^2 + orth_weight * ||r - <r,u>u||^2) / dim
+
+    Rationale: steering displacements are much larger than the pooled diff
+    between two same-prompt responses, and mostly orthogonal to it (content
+    vs. concept). Full L2 (orth_weight=1, equivalent to mean_l2) then punishes
+    a *correct* concept for its orthogonal bulk; proj rewards movement toward
+    h_b while only softly penalizing off-axis drift. Overshoot along u is
+    still penalized, so alpha stays calibrated. d0 = ||diff||^2/dim either way,
+    keeping the explained fraction comparable.
+    """
+    if kind == "proj":
+        assert h_a is not None and mask_a is not None, "proj needs the h_a reference"
+        pool_b = masked_mean(h_b, mask_b)              # [1, d]
+        pool_a = masked_mean(h_a.float(), mask_a)
+        diff = pool_b - pool_a
+        u = diff / diff.norm().clamp(min=1e-8)
+        dim = h_b.size(-1)
+
+        def f(h, mask):
+            r = masked_mean(h, mask) - pool_b
+            along = (r * u).sum()
+            orth = r - along * u
+            return (along.pow(2) + orth_weight * orth.pow(2).sum()) / dim
+        return f
+
     def f(h, mask):
         return activation_distance(h, mask, h_b, mask_b, kind=kind)
     return f
@@ -107,12 +137,13 @@ def solve_sparse(mixture, h_a, mask_a, h_b, mask_b,
                  concept_hidden, concept_mask, *,
                  distance="mean_l2", l1_weight=0.05, iters=200, lr=0.1,
                  alpha_max=4.0, alpha_init=0.1, threshold=0.05,
-                 refit=True, seed=0, padding_mask=None, verbose=False):
+                 refit=True, seed=0, padding_mask=None, orth_weight=0.1,
+                 verbose=False):
     """Gradient-based sparse inverse: alpha = alpha_max * sigmoid(rho),
     Adam on rho, L1 on alpha, hard-threshold + optional refit of survivors."""
     device = h_a.device
     m_total = concept_hidden.size(0)
-    dist = _distance_fn(distance, h_b.float(), mask_b)
+    dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a, orth_weight)
 
     d0 = dist(h_a.float(), mask_a).item()
     if d0 < 1e-12:
@@ -170,12 +201,12 @@ def solve_greedy(mixture, h_a, mask_a, h_b, mask_b,
                  concept_hidden, concept_mask, *,
                  distance="mean_l2", grid=(0.5, 1.0, 1.5, 2.0, 3.0),
                  max_k=4, min_rel_improve=0.02, padding_mask=None,
-                 verbose=False):
+                 orth_weight=0.1, verbose=False):
     """Greedy bank search baseline: repeatedly add the (concept, strength)
     pair that most reduces the distance, until improvement saturates."""
     device = h_a.device
     m_total = concept_hidden.size(0)
-    dist = _distance_fn(distance, h_b.float(), mask_b)
+    dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a, orth_weight)
 
     d0 = dist(h_a.float(), mask_a).item()
     if d0 < 1e-12:

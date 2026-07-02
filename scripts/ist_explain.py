@@ -100,8 +100,18 @@ def main():
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--method", choices=["sparse", "greedy", "both"],
                         default="sparse")
-    parser.add_argument("--distance", choices=["mean_l2", "mmd"],
-                        default="mean_l2")
+    parser.add_argument("--distance", choices=["proj", "mean_l2", "mmd"],
+                        default="proj",
+                        help="proj (default): penalize only the residual along "
+                             "the a->b diff direction, discounting orthogonal "
+                             "displacement by --orth-weight. mean_l2/mmd are "
+                             "the strict distributional variants (mean_l2 "
+                             "punishes the orthogonal bulk of steering "
+                             "displacements and typically returns empty "
+                             "explanations).")
+    parser.add_argument("--orth-weight", type=float, default=0.1,
+                        help="proj distance: weight on displacement orthogonal "
+                             "to the a->b diff (1.0 ~= mean_l2)")
     parser.add_argument("--n-steps", type=int, default=3,
                         help="Euler steps of the transport mixture")
     parser.add_argument("--l1-weight", type=float, default=0.05)
@@ -157,7 +167,8 @@ def main():
                     concept_hidden, concept_mask,
                     distance=args.distance, l1_weight=args.l1_weight,
                     iters=args.iters, lr=args.lr, alpha_max=args.alpha_max,
-                    threshold=args.threshold, seed=seed)
+                    threshold=args.threshold, seed=seed,
+                    orth_weight=args.orth_weight)
                 per_seed.append(res)
             canonical = per_seed[0]
             stability = None
@@ -169,7 +180,8 @@ def main():
         if args.method in ("greedy", "both"):
             res = solve_greedy(
                 mixture, h_a, mask_a, h_b, mask_b,
-                concept_hidden, concept_mask, distance=args.distance)
+                concept_hidden, concept_mask, distance=args.distance,
+                orth_weight=args.orth_weight)
             solutions["greedy"] = (res, None)
 
         for name, (res, stability) in solutions.items():
