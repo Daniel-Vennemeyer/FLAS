@@ -138,6 +138,13 @@ def main():
                              "secondary edits.")
     parser.add_argument("--greedy-max-k", type=int, default=4,
                         help="greedy: max concepts per explanation")
+    parser.add_argument("--verify-dnll", type=float, default=0.05,
+                        help="behavioral verification: an explanation is "
+                             "'verified' only if applying its transport raises "
+                             "y_b's log-likelihood by at least this many "
+                             "nats/token. Empirically separates true "
+                             "recoveries (dNLL >> 0) from spurious "
+                             "activation-space matches (dNLL <= 0).")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--alpha-max", type=float, default=4.0)
@@ -275,6 +282,8 @@ def main():
                 "nll_yb_unsteered": round(nll_base, 4),
                 "nll_yb_steered": round(nll_steer, 4),
                 "delta_nll": round(nll_base - nll_steer, 4),
+                "verified": bool(explanation
+                                 and nll_base - nll_steer >= args.verify_dnll),
             }
             if stability is not None:
                 sol["seed_stability_jaccard"] = round(stability, 3)
@@ -282,8 +291,10 @@ def main():
                 sol["recovery"] = recovery_metrics(
                     res.support, [e["concept_id"] for e in pair["edits"]], bank)
             entry[name] = sol
+            flag = "verified" if sol["verified"] else (
+                "REJECTED" if explanation else "empty")
             print(f"  [{name}] EF={sol['explained_fraction']:.3f} "
-                  f"dNLL={sol['delta_nll']:+.3f} "
+                  f"dNLL={sol['delta_nll']:+.3f} [{flag}] "
                   f"explanation={[(e['concept'][:30], e['alpha']) for e in explanation]}")
         results.append(entry)
 
@@ -309,6 +320,32 @@ def main():
             agg["recovery"] = {
                 k: float(np.mean([r[k] for r in recov]))
                 for k in ("precision", "recall", "f1")}
+
+            # Micro-averaged recovery (aggregate TP/FP/FN across pairs),
+            # raw and with dNLL-rejected explanations treated as empty.
+            def micro(verified_only):
+                tp = fp = fn = 0
+                for r in results:
+                    if name not in r or "true_edits" not in r:
+                        continue
+                    sol = r[name]
+                    preds = {e["concept_id"] for e in sol["explanation"]}
+                    if verified_only and not sol["verified"]:
+                        preds = set()
+                    true = {e["concept_id"] for e in r["true_edits"]}
+                    tp += len(preds & true)
+                    fp += len(preds - true)
+                    fn += len(true - preds)
+                p = tp / (tp + fp) if tp + fp else 0.0
+                rc = tp / (tp + fn) if tp + fn else 0.0
+                f1 = 2 * p * rc / (p + rc) if p + rc else 0.0
+                return {"precision": p, "recall": rc, "f1": f1,
+                        "tp": tp, "fp": fp, "fn": fn}
+
+            agg["recovery_micro"] = micro(verified_only=False)
+            agg["recovery_micro_dnll_verified"] = micro(verified_only=True)
+            agg["n_verified"] = sum(
+                1 for r in rows if r["verified"])
             # Strength calibration over recovered edits: inferred alpha vs
             # ground-truth ordinal strength.
             xs, ys = [], []
