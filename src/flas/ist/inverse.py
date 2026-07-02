@@ -338,23 +338,42 @@ def solve_greedy(mixture, h_a, mask_a, h_b, mask_b,
         return SolveResult(torch.zeros(m_total, device=device), [], d0, d0, 0.0)
 
     alphas = torch.zeros(m_total, device=device)
+    support = []
     d_cur = d0
     for _round in range(max_k):
         best = None  # (d, idx, strength)
-        for i in range(m_total):
-            if alphas[i] > 0:
-                continue
+        if not support:
+            # First round vectorized: single-concept transports for the whole
+            # bank per grid strength (one batched integration per strength).
             for g in grid:
-                cand = alphas.clone()
-                cand[i] = g
-                d = _evaluate(mixture, h_a, mask_a, dist, cand,
-                              concept_hidden, concept_mask, padding_mask).item()
-                if best is None or d < best[0]:
-                    best = (d, i, g)
+                states = mixture.individual_transports(
+                    h_a, concept_hidden, concept_mask, g, padding_mask)
+                for i in range(m_total):
+                    d = dist(states[i:i + 1].float(), mask_a).item()
+                    if best is None or d < best[0]:
+                        best = (d, i, g)
+        else:
+            # Later rounds: integrate only support + candidate (batch k+1),
+            # not the whole bank with a mostly-zero alphas vector.
+            for i in range(m_total):
+                if alphas[i] > 0:
+                    continue
+                for g in grid:
+                    idx = support + [i]
+                    a_sub = torch.tensor(
+                        [float(alphas[j]) for j in support] + [g],
+                        device=device)
+                    h_t = mixture.transport(
+                        h_a, concept_hidden[idx], concept_mask[idx], a_sub,
+                        padding_mask=padding_mask)
+                    d = dist(h_t.float(), mask_a).item()
+                    if best is None or d < best[0]:
+                        best = (d, i, g)
         if best is None or (d_cur - best[0]) / d0 < min_rel_improve:
             break
         d_cur, idx, g = best
         alphas[idx] = g
+        support.append(idx)
         if verbose:
             print(f"    greedy +concept[{idx}] @ {g}: d/d0={d_cur / d0:.4f}")
 

@@ -66,6 +66,9 @@ def main():
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     gen = load_generator(args.flow_ckpt, model_id=args.model_id,
                          layer=args.layer, num_blocks=args.num_blocks)
     llm, tokenizer, layer = gen.llm, gen.tokenizer, gen.layer
