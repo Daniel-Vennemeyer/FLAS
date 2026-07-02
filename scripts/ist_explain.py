@@ -129,7 +129,15 @@ def main():
                              "once and collapses to the empty solution)")
     parser.add_argument("--n-steps", type=int, default=3,
                         help="Euler steps of the transport mixture")
-    parser.add_argument("--l1-weight", type=float, default=0.05)
+    parser.add_argument("--l1-weight", type=float, default=0.05,
+                        help="sparse: L1 penalty on alphas. Lower to recover "
+                             "secondary edits (recall), raise for precision.")
+    parser.add_argument("--greedy-min-improve", type=float, default=0.02,
+                        help="greedy: stop when the best addition improves "
+                             "d/d0 by less than this. Lower to recover "
+                             "secondary edits.")
+    parser.add_argument("--greedy-max-k", type=int, default=4,
+                        help="greedy: max concepts per explanation")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--alpha-max", type=float, default=4.0)
@@ -208,7 +216,9 @@ def main():
             res = solve_greedy(
                 mixture, h_a, mask_a, h_b, mask_b,
                 concept_hidden, concept_mask, distance=args.distance,
-                orth_weight=args.orth_weight, deflate=deflate)
+                orth_weight=args.orth_weight, deflate=deflate,
+                max_k=args.greedy_max_k,
+                min_rel_improve=args.greedy_min_improve)
             solutions["greedy"] = (res, None)
 
         for name, (res, stability) in solutions.items():
