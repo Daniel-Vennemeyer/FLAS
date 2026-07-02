@@ -19,6 +19,18 @@ dependencies = [
     "gradio>=6.14.0",
 ]
 
+# On Linux, pull torch from the CUDA 12.8 index instead of PyPI: PyPI's newest
+# torch (>= 2.12) ships CUDA-13 builds that require driver >= 575, while cu128
+# wheels run on any 12.x driver >= 525 via minor-version compatibility (covers
+# common cluster drivers like 550 = CUDA 12.4). macOS keeps the default wheel.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
