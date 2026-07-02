@@ -14,7 +14,8 @@ from transformers.models.gemma2 import Gemma2Config
 from flas.model import FlowFunction
 from flas.ist.activations import activation_distance, masked_mean
 from flas.ist.inverse import (
-    TransportMixture, generic_direction, solve_greedy, solve_sparse)
+    TransportMixture, bank_displacements, generic_direction, shared_subspace,
+    solve_greedy, solve_sparse)
 
 torch.manual_seed(0)
 
@@ -135,6 +136,27 @@ def test_individual_transports_match_onehot():
             f"individual transport {i} != one-hot mixture transport"
 
 
+def test_shared_subspace_basis():
+    flow = tiny_flow()
+    mixture = TransportMixture(flow, n_steps=N)
+    h = torch.randn(1, S, D)
+    mask = torch.ones(1, S)
+    ch, cm = torch.randn(M, L, D), torch.ones(M, L)
+    disp = bank_displacements(mixture, h, mask, ch, cm, alpha_ref=1.0)
+    assert disp.shape == (M, D)
+    assert shared_subspace(disp, rank=0) is None
+    for r in (1, 2, 3):
+        basis = shared_subspace(disp, rank=r)
+        assert basis.shape == (r, D)
+        gram = basis @ basis.T
+        assert torch.allclose(gram, torch.eye(r), atol=1e-4), \
+            f"rank-{r} basis is not orthonormal"
+    # rank-1 must match the legacy generic_direction (up to sign)
+    g = generic_direction(mixture, h, mask, ch, cm, alpha_ref=1.0)
+    b1 = shared_subspace(disp, rank=1)
+    assert torch.allclose(g.abs(), b1.abs(), atol=1e-4)
+
+
 def test_deflated_recovery_under_generic_confound():
     """When h_b carries a large component along the bank-mean (generic)
     steering direction, deflating it must still recover the planted concepts
@@ -199,6 +221,7 @@ if __name__ == "__main__":
     for fn in [test_transport_shapes_and_identity, test_chunking_equivalence,
                test_gradient_flows_to_alphas, test_distances,
                test_individual_transports_match_onehot,
+               test_shared_subspace_basis,
                test_deflated_recovery_under_generic_confound,
                test_sparse_recovery, test_sparse_recovery_proj,
                test_greedy_recovery]:

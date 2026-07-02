@@ -33,7 +33,9 @@ import torch
 
 from flas.generate import load_generator
 from flas.ist.activations import extract_layer_activations, masked_mean
-from flas.ist.inverse import TransportMixture
+from flas.ist.inverse import TransportMixture, shared_subspace
+
+DEFLATE_RANKS = (0, 1, 2, 3)
 
 
 def load_bank(path):
@@ -81,8 +83,7 @@ def main():
 
     pairs = json.load(open(args.pairs_file))[:args.max_pairs]
     all_rows = []
-    true_ranks = []
-    true_ranks_centered = []
+    ranks_by_r = {r: [] for r in DEFLATE_RANKS}
 
     for pair in pairs:
         h_a, mask_a, _ = extract_layer_activations(
@@ -104,12 +105,14 @@ def main():
               f"(diff/pool_a = {diff.norm() / pool_a.norm():.4f})")
 
         rows = []
+        disp_by_alpha = []
         with torch.no_grad():
             for alpha in args.alphas:
                 states = mixture.individual_transports(
                     h_a, concept_hidden, concept_mask, alpha)
                 m = mask_a.expand(states.size(0), -1)
                 disp = masked_mean(states.float(), m) - pool_a.unsqueeze(0)  # [M, d]
+                disp_by_alpha.append(disp)
                 # Centered displacement: subtract the bank-mean (generic)
                 # component so concepts are compared on what distinguishes them.
                 cdisp = disp - disp.mean(dim=0, keepdim=True)
@@ -133,21 +136,37 @@ def main():
                     })
         all_rows.extend(rows)
 
-        # Rank concepts by their best (centered) cosine over the probed alphas.
-        def rank_by(key, ranks_acc):
-            best = {}
-            for r in rows:
-                k = r["concept_id"]
-                if k not in best or r[key] > best[k][key]:
-                    best[k] = r
-            ranked = sorted(best.values(), key=lambda r: -r[key])
-            for rank, r in enumerate(ranked, 1):
-                if r["is_true"]:
-                    ranks_acc.append(rank)
-            return ranked
+        # Deflation-rank sweep: for each rank K, project the shared subspace
+        # (bank mean + top K-1 PCs of the displacements) out of both sides and
+        # rank concepts by best deflated cosine over the probed alphas. This
+        # is exactly what the solver's --deflate-rank metric uses.
+        with torch.no_grad():
+            for r_k in DEFLATE_RANKS:
+                best = None
+                for disp in disp_by_alpha:
+                    basis = shared_subspace(disp, rank=r_k)
+                    if basis is None:
+                        ddisp, ddiff = disp, diff
+                    else:
+                        ddisp = disp - (disp @ basis.T) @ basis
+                        ddiff = (diff.unsqueeze(0)
+                                 - (diff.unsqueeze(0) @ basis.T) @ basis)[0]
+                    cs = torch.nn.functional.cosine_similarity(
+                        ddisp, ddiff.unsqueeze(0), dim=1)  # [M]
+                    best = cs if best is None else torch.maximum(best, cs)
+                order = best.argsort(descending=True).tolist()
+                rank_of = {bank[i]["concept_id"]: rank
+                           for rank, i in enumerate(order, 1)}
+                for cid in true_ids:
+                    ranks_by_r[r_k].append(rank_of[cid])
 
-        ranked_c = rank_by("ccos", true_ranks_centered)
-        rank_by("cos", true_ranks)
+        # Table: rank by best mean-centered cosine (ccos) for display.
+        best_row = {}
+        for r in rows:
+            k = r["concept_id"]
+            if k not in best_row or r["ccos"] > best_row[k]["ccos"]:
+                best_row[k] = r
+        ranked_c = sorted(best_row.values(), key=lambda r: -r["ccos"])
 
         print(f"{'rank':>4} {'ccos':>7} {'cos':>7} {'ratio':>7} {'proj':>7}  concept")
         for rank, r in enumerate(ranked_c, 1):
@@ -158,20 +177,20 @@ def main():
                       f"{r['ratio']:>7.2f} {r['proj_frac']:>7.3f}  "
                       f"{r['concept'][:45]}{mark}{extra}")
 
-    n_true = len(true_ranks)
+    n_true = len(ranks_by_r[0])
     m = len(bank)
     print(f"\n=== Signal summary over {len(pairs)} pairs, {n_true} true edits, "
           f"bank size {m} ===")
     if n_true:
-        for label, ranks in (("raw cosine", true_ranks),
-                             ("CENTERED cosine", true_ranks_centered)):
-            tr = np.array(ranks)
-            print(f"true-concept rank by {label}: mean {tr.mean():.1f} "
-                  f"(random = {(m + 1) / 2:.1f}), median {np.median(tr):.0f}  |  "
-                  f"top-1 {np.mean(tr == 1):.2f}  top-3 {np.mean(tr <= 3):.2f}  "
-                  f"top-5 {np.mean(tr <= 5):.2f}")
-        print("(centered = bank-mean displacement removed; this is what the "
-              "solver's --deflate-generic metric uses)")
+        print("true-concept rank by deflated cosine (random mean = "
+              f"{(m + 1) / 2:.1f}):")
+        for r_k in DEFLATE_RANKS:
+            tr = np.array(ranks_by_r[r_k])
+            label = "raw (no deflation)" if r_k == 0 else f"deflate-rank {r_k}"
+            print(f"  {label:<20} mean {tr.mean():>5.1f}  median "
+                  f"{np.median(tr):>3.0f}  |  top-1 {np.mean(tr == 1):.2f}  "
+                  f"top-3 {np.mean(tr <= 3):.2f}  top-5 {np.mean(tr <= 5):.2f}")
+        print("(pass the best rank to ist_explain.py as --deflate-rank)")
     ratios = np.array([r["ratio"] for r in all_rows])
     print(f"displacement/diff ratio: median {np.median(ratios):.2f} "
           f"(>>1 means steering moves far beyond the response gap — "

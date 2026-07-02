@@ -110,22 +110,48 @@ class TransportMixture:
 
 
 @torch.no_grad()
-def generic_direction(mixture, h_a, mask_a, concept_hidden, concept_mask,
-                      alpha_ref=2.0, padding_mask=None):
-    """Unit vector [1, d] of the bank-mean pooled steering displacement.
-
-    FLAS trajectories share a large concept-independent component (paper
-    Sec 6.1: all concepts leave the origin in a shared direction). That
-    generic component correlates with any edited-vs-neutral response diff and
-    dominates concept ranking. Deflating it from the proj metric (pass as
-    `deflate=` to the solvers) makes concepts compete only on their
-    distinctive components."""
+def bank_displacements(mixture, h_a, mask_a, concept_hidden, concept_mask,
+                       alpha_ref=2.0, padding_mask=None):
+    """Pooled per-concept steering displacements [M, d] at alpha_ref."""
     states = mixture.individual_transports(
         h_a, concept_hidden, concept_mask, alpha_ref, padding_mask)
     m = mask_a.expand(states.size(0), -1)
-    disp = masked_mean(states.float(), m) - masked_mean(h_a.float(), mask_a)
-    g = disp.mean(dim=0, keepdim=True)  # [1, d]
-    return g / g.norm().clamp(min=1e-8)
+    return masked_mean(states.float(), m) - masked_mean(h_a.float(), mask_a)
+
+
+def shared_subspace(disp, rank=1):
+    """Orthonormal basis [rank, d] of the bank-shared displacement subspace:
+    the mean direction plus the top (rank-1) principal components of the
+    mean-centered displacements. rank=0 returns None.
+
+    FLAS trajectories share concept-independent structure (paper Sec 6.1: a
+    common initial direction; empirically also a low-rank 'style intensity'
+    subspace that generic concepts like 'humorous'/'poetic' load on). That
+    shared structure correlates with any edited-vs-neutral response diff and
+    dominates concept ranking. Deflating it from the proj metric (pass as
+    `deflate=` to the solvers) makes concepts compete on what distinguishes
+    them."""
+    if rank <= 0:
+        return None
+    g = disp.mean(dim=0, keepdim=True)          # [1, d]
+    basis = [g / g.norm().clamp(min=1e-8)]
+    if rank > 1:
+        centered = disp - g
+        # PCs of the centered bank displacements (right singular vectors).
+        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+        basis.append(vh[: rank - 1])
+    stacked = torch.cat(basis, dim=0)           # [rank, d]
+    q, _ = torch.linalg.qr(stacked.T)           # orthonormalize rows
+    return q.T[:rank].contiguous()
+
+
+@torch.no_grad()
+def generic_direction(mixture, h_a, mask_a, concept_hidden, concept_mask,
+                      alpha_ref=2.0, padding_mask=None):
+    """Back-compat wrapper: rank-1 shared subspace (bank-mean direction)."""
+    disp = bank_displacements(mixture, h_a, mask_a, concept_hidden,
+                              concept_mask, alpha_ref, padding_mask)
+    return shared_subspace(disp, rank=1)
 
 
 @dataclass

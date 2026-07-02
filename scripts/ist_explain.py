@@ -35,8 +35,8 @@ import torch
 from flas.generate import load_generator
 from flas.ist.activations import extract_layer_activations
 from flas.ist.inverse import (
-    TransportMixture, generic_direction, solve_greedy, solve_sparse,
-    steered_nll)
+    TransportMixture, bank_displacements, shared_subspace, solve_greedy,
+    solve_sparse, steered_nll)
 
 
 def load_bank(path):
@@ -113,15 +113,14 @@ def main():
     parser.add_argument("--orth-weight", type=float, default=0.1,
                         help="proj distance: weight on displacement orthogonal "
                              "to the a->b diff (1.0 ~= mean_l2)")
-    parser.add_argument("--deflate-generic",
-                        action=argparse.BooleanOptionalAction, default=True,
-                        help="proj distance: project the bank-mean steering "
-                             "direction out of the metric, so concepts compete "
-                             "on distinctive components only (FLAS "
-                             "displacements share a large generic component "
-                             "that otherwise dominates ranking)")
+    parser.add_argument("--deflate-rank", type=int, default=1,
+                        help="proj distance: project the rank-K shared "
+                             "displacement subspace (bank mean + top K-1 PCs) "
+                             "out of the metric, so concepts compete on "
+                             "distinctive components only. 0 disables. Pick K "
+                             "with the rank sweep in ist_diagnose.py.")
     parser.add_argument("--deflate-alpha", type=float, default=2.0,
-                        help="reference strength for the generic direction")
+                        help="reference strength for the shared subspace")
     parser.add_argument("--n-steps", type=int, default=3,
                         help="Euler steps of the transport mixture")
     parser.add_argument("--l1-weight", type=float, default=0.05)
@@ -169,10 +168,11 @@ def main():
             entry["true_edits"] = pair["edits"]
 
         deflate = None
-        if args.deflate_generic and args.distance == "proj":
-            deflate = generic_direction(
+        if args.deflate_rank > 0 and args.distance == "proj":
+            disp = bank_displacements(
                 mixture, h_a, mask_a, concept_hidden, concept_mask,
                 alpha_ref=args.deflate_alpha)
+            deflate = shared_subspace(disp, rank=args.deflate_rank)
 
         solutions = {}
         if args.method in ("sparse", "both"):
