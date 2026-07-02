@@ -15,7 +15,7 @@ from flas.model import FlowFunction
 from flas.ist.activations import activation_distance, masked_mean
 from flas.ist.inverse import (
     TransportMixture, bank_displacements, generic_direction, shared_subspace,
-    solve_greedy, solve_sparse)
+    solve_greedy, solve_sparse, warm_start_alphas)
 
 torch.manual_seed(0)
 
@@ -204,6 +204,30 @@ def test_sparse_recovery_proj():
         f"proj solver found none of the planted concepts (top2={top2})"
 
 
+def test_warm_started_recovery():
+    """Warm-starting from per-concept alignment scores must recover the
+    planted transport (the uniform-init mixture superposition can collapse
+    to the empty solution on larger banks)."""
+    flow = tiny_flow()
+    for p in flow.parameters():
+        p.requires_grad_(False)
+    mixture, h_a, mask, h_b, ch, cm, alphas_true = make_problem(flow)
+    disp = bank_displacements(mixture, h_a, mask, ch, cm, alpha_ref=1.0)
+    init = warm_start_alphas(disp, h_a, mask, h_b, mask)
+    assert init.shape == (M,) and (init >= 1e-3).all()
+
+    res = solve_sparse(
+        mixture, h_a, mask, h_b, mask, ch, cm,
+        distance="proj", orth_weight=0.1, init_alphas=init,
+        l1_weight=0.01, iters=250, lr=0.15, alpha_max=4.0,
+        threshold=0.1, seed=0)
+    print(f"  warm-start EF={res.explained_fraction:.3f}  support={res.support}")
+    true_support = set(torch.nonzero(alphas_true).flatten().tolist())
+    top2 = set(torch.topk(res.alphas, 2).indices.tolist())
+    assert top2 & true_support, \
+        f"warm-started solver found none of the planted concepts (top2={top2})"
+
+
 def test_greedy_recovery():
     flow = tiny_flow()
     mixture, h_a, mask, h_b, ch, cm, alphas_true = make_problem(flow)
@@ -224,7 +248,7 @@ if __name__ == "__main__":
                test_shared_subspace_basis,
                test_deflated_recovery_under_generic_confound,
                test_sparse_recovery, test_sparse_recovery_proj,
-               test_greedy_recovery]:
+               test_warm_started_recovery, test_greedy_recovery]:
         print(f"{fn.__name__} ...")
         fn()
         print(f"{fn.__name__} PASSED\n")

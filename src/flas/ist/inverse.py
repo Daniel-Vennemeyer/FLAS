@@ -17,7 +17,6 @@ directly with Adam; `solve_greedy` is the grid-search baseline (Sec 8.1 of
 the proposal). Run the FlowFunction in float32 for solver stability.
 """
 
-import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -154,6 +153,26 @@ def generic_direction(mixture, h_a, mask_a, concept_hidden, concept_mask,
     return shared_subspace(disp, rank=1)
 
 
+@torch.no_grad()
+def warm_start_alphas(disp, h_a, mask_a, h_b, mask_b, deflate=None,
+                      floor=0.02, scale=0.75):
+    """Per-concept initial strengths for solve_sparse, from the alignment of
+    each bank displacement with the a->b diff (in the deflated metric if a
+    basis is given): unaligned concepts start at `floor` (near-identity),
+    the best-aligned at floor + scale."""
+    pool_a = masked_mean(h_a.float(), mask_a)
+    pool_b = masked_mean(h_b.float(), mask_b)
+    diff = pool_b - pool_a                      # [1, d]
+    if deflate is not None:
+        d = deflate.to(diff)
+        disp = disp - (disp @ d.T) @ d
+        diff = diff - (diff @ d.T) @ d
+    cs = F.cosine_similarity(disp, diff, dim=1).relu()  # [M]
+    if cs.max() <= 0:
+        return torch.full((disp.size(0),), floor, device=disp.device)
+    return floor + scale * cs / cs.max()
+
+
 @dataclass
 class SolveResult:
     alphas: torch.Tensor              # [M] final strengths (thresholded)
@@ -228,9 +247,18 @@ def solve_sparse(mixture, h_a, mask_a, h_b, mask_b,
                  distance="mean_l2", l1_weight=0.05, iters=200, lr=0.1,
                  alpha_max=4.0, alpha_init=0.1, threshold=0.05,
                  refit=True, seed=0, padding_mask=None, orth_weight=0.1,
-                 deflate=None, verbose=False):
+                 deflate=None, init_alphas=None, verbose=False):
     """Gradient-based sparse inverse: alpha = alpha_max * sigmoid(rho),
-    Adam on rho, L1 on alpha, hard-threshold + optional refit of survivors."""
+    Adam on rho, L1 on alpha, hard-threshold + optional refit of survivors.
+
+    init_alphas [M] warm-starts the solve (e.g. from per-concept alignment
+    scores — see warm_start_alphas). Without it, all concepts start at
+    alpha_init simultaneously; for banks of ~24+ concepts that initial
+    superposition is a large off-manifold displacement whose gradient pushes
+    every alpha down together, after which the sigmoid saturates near zero
+    and even well-aligned concepts cannot escape the L1 pressure. A
+    score-based warm start (junk near 0, aligned concepts meaningful) begins
+    the integration near-identity and avoids the collapse."""
     device = h_a.device
     m_total = concept_hidden.size(0)
     dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a,
@@ -241,10 +269,15 @@ def solve_sparse(mixture, h_a, mask_a, h_b, mask_b,
         return SolveResult(torch.zeros(m_total, device=device), [], d0, d0, 0.0)
 
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    rho0 = math.log(alpha_init / (alpha_max - alpha_init))
+    if init_alphas is None:
+        alpha0 = torch.full((m_total,), alpha_init, device=device)
+    else:
+        alpha0 = init_alphas.to(device).float()
+    alpha0 = alpha0.clamp(min=1e-3, max=0.9 * alpha_max)
+    rho0 = torch.log(alpha0 / (alpha_max - alpha0))  # logit, [M]
 
     def _optimize(support_mask, n_iters):
-        rho = torch.full((m_total,), rho0, device=device)
+        rho = rho0.clone()
         rho += 0.01 * torch.randn(m_total, generator=gen).to(device)
         rho.requires_grad_(True)
         opt = torch.optim.Adam([rho], lr=lr)

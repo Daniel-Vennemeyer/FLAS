@@ -36,7 +36,7 @@ from flas.generate import load_generator
 from flas.ist.activations import extract_layer_activations
 from flas.ist.inverse import (
     TransportMixture, bank_displacements, shared_subspace, solve_greedy,
-    solve_sparse, steered_nll)
+    solve_sparse, steered_nll, warm_start_alphas)
 
 
 def load_bank(path):
@@ -121,6 +121,12 @@ def main():
                              "with the rank sweep in ist_diagnose.py.")
     parser.add_argument("--deflate-alpha", type=float, default=2.0,
                         help="reference strength for the shared subspace")
+    parser.add_argument("--warm-start",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="initialize sparse alphas from per-concept "
+                             "alignment scores instead of a uniform 0.1 "
+                             "(uniform init superimposes the whole bank at "
+                             "once and collapses to the empty solution)")
     parser.add_argument("--n-steps", type=int, default=3,
                         help="Euler steps of the transport mixture")
     parser.add_argument("--l1-weight", type=float, default=0.05)
@@ -167,12 +173,16 @@ def main():
         if "edits" in pair:
             entry["true_edits"] = pair["edits"]
 
-        deflate = None
-        if args.deflate_rank > 0 and args.distance == "proj":
+        deflate, init_alphas = None, None
+        if args.distance == "proj":
             disp = bank_displacements(
                 mixture, h_a, mask_a, concept_hidden, concept_mask,
                 alpha_ref=args.deflate_alpha)
-            deflate = shared_subspace(disp, rank=args.deflate_rank)
+            if args.deflate_rank > 0:
+                deflate = shared_subspace(disp, rank=args.deflate_rank)
+            if args.warm_start:
+                init_alphas = warm_start_alphas(
+                    disp, h_a, mask_a, h_b, mask_b, deflate=deflate)
 
         solutions = {}
         if args.method in ("sparse", "both"):
@@ -184,7 +194,8 @@ def main():
                     distance=args.distance, l1_weight=args.l1_weight,
                     iters=args.iters, lr=args.lr, alpha_max=args.alpha_max,
                     threshold=args.threshold, seed=seed,
-                    orth_weight=args.orth_weight, deflate=deflate)
+                    orth_weight=args.orth_weight, deflate=deflate,
+                    init_alphas=init_alphas)
                 per_seed.append(res)
             canonical = per_seed[0]
             stability = None
