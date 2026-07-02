@@ -11,5 +11,6 @@ Modules:
 
 from flas.ist.activations import (
     extract_layer_activations, activation_distance, masked_mean)
-from flas.ist.inverse import TransportMixture, solve_sparse, solve_greedy, steered_nll
+from flas.ist.inverse import (
+    TransportMixture, generic_direction, solve_sparse, solve_greedy, steered_nll)
 from flas.ist.mixture_generate import MixtureFlasGenerator, load_mixture_generator

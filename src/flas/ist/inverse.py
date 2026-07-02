@@ -78,6 +78,55 @@ class TransportMixture:
             h = h + v_total
         return h
 
+    @torch.no_grad()
+    def individual_transports(self, h, concept_hidden, concept_mask, alpha,
+                              padding_mask=None):
+        """Integrate each concept's flow independently at strength `alpha`
+        (equivalent to M one-hot transport() calls, batched). Returns the
+        transported states [M, S, d]."""
+        assert h.size(0) == 1
+        h = h.to(self._dtype)
+        concept_hidden = concept_hidden.to(self._dtype)
+        n = self.n_steps
+        m_total = concept_hidden.size(0)
+        if padding_mask is None:
+            padding_mask = torch.ones(1, h.size(1), device=h.device)
+        padding_mask = padding_mask.float()
+
+        outs = []
+        for start in range(0, m_total, self.concept_chunk):
+            sl = slice(start, min(start + self.concept_chunk, m_total))
+            m = sl.stop - sl.start
+            states = h.expand(m, -1, -1).contiguous()
+            dt = alpha / n
+            for k in range(n):
+                t_k = torch.full((m,), k * dt, device=h.device)
+                v, _ = self.flow_fn(
+                    states, concept_hidden[sl], concept_mask[sl].float(),
+                    t=t_k, padding_mask=padding_mask.expand(m, -1))
+                states = states + dt * v
+            outs.append(states)
+        return torch.cat(outs, dim=0)
+
+
+@torch.no_grad()
+def generic_direction(mixture, h_a, mask_a, concept_hidden, concept_mask,
+                      alpha_ref=2.0, padding_mask=None):
+    """Unit vector [1, d] of the bank-mean pooled steering displacement.
+
+    FLAS trajectories share a large concept-independent component (paper
+    Sec 6.1: all concepts leave the origin in a shared direction). That
+    generic component correlates with any edited-vs-neutral response diff and
+    dominates concept ranking. Deflating it from the proj metric (pass as
+    `deflate=` to the solvers) makes concepts compete only on their
+    distinctive components."""
+    states = mixture.individual_transports(
+        h_a, concept_hidden, concept_mask, alpha_ref, padding_mask)
+    m = mask_a.expand(states.size(0), -1)
+    disp = masked_mean(states.float(), m) - masked_mean(h_a.float(), mask_a)
+    g = disp.mean(dim=0, keepdim=True)  # [1, d]
+    return g / g.norm().clamp(min=1e-8)
+
 
 @dataclass
 class SolveResult:
@@ -89,7 +138,8 @@ class SolveResult:
     history: List[float] = field(default_factory=list)
 
 
-def _distance_fn(kind, h_b, mask_b, h_a=None, mask_a=None, orth_weight=0.1):
+def _distance_fn(kind, h_b, mask_b, h_a=None, mask_a=None, orth_weight=0.1,
+                 deflate=None):
     """Bind the target side; returns f(h, mask) -> scalar distance.
 
     kind="proj" decomposes the residual pool(h) - pool(h_b) into its component
@@ -110,12 +160,26 @@ def _distance_fn(kind, h_b, mask_b, h_a=None, mask_a=None, orth_weight=0.1):
         assert h_a is not None and mask_a is not None, "proj needs the h_a reference"
         pool_b = masked_mean(h_b, mask_b)              # [1, d]
         pool_a = masked_mean(h_a.float(), mask_a)
-        diff = pool_b - pool_a
-        u = diff / diff.norm().clamp(min=1e-8)
         dim = h_b.size(-1)
 
+        # `deflate` [K, d] (unit rows, e.g. the generic steering direction from
+        # generic_direction()): movement along these directions is free — both
+        # the target diff and the residual are projected onto their
+        # orthocomplement, so concepts compete on distinctive components only.
+        if deflate is not None:
+            deflate = deflate.to(pool_b)
+
+            def _defl(x):
+                return x - (x @ deflate.T) @ deflate
+        else:
+            def _defl(x):
+                return x
+
+        diff = _defl(pool_b - pool_a)
+        u = diff / diff.norm().clamp(min=1e-8)
+
         def f(h, mask):
-            r = masked_mean(h, mask) - pool_b
+            r = _defl(masked_mean(h, mask) - pool_b)
             along = (r * u).sum()
             orth = r - along * u
             return (along.pow(2) + orth_weight * orth.pow(2).sum()) / dim
@@ -138,12 +202,13 @@ def solve_sparse(mixture, h_a, mask_a, h_b, mask_b,
                  distance="mean_l2", l1_weight=0.05, iters=200, lr=0.1,
                  alpha_max=4.0, alpha_init=0.1, threshold=0.05,
                  refit=True, seed=0, padding_mask=None, orth_weight=0.1,
-                 verbose=False):
+                 deflate=None, verbose=False):
     """Gradient-based sparse inverse: alpha = alpha_max * sigmoid(rho),
     Adam on rho, L1 on alpha, hard-threshold + optional refit of survivors."""
     device = h_a.device
     m_total = concept_hidden.size(0)
-    dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a, orth_weight)
+    dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a,
+                        orth_weight, deflate)
 
     d0 = dist(h_a.float(), mask_a).item()
     if d0 < 1e-12:
@@ -201,12 +266,13 @@ def solve_greedy(mixture, h_a, mask_a, h_b, mask_b,
                  concept_hidden, concept_mask, *,
                  distance="mean_l2", grid=(0.5, 1.0, 1.5, 2.0, 3.0),
                  max_k=4, min_rel_improve=0.02, padding_mask=None,
-                 orth_weight=0.1, verbose=False):
+                 orth_weight=0.1, deflate=None, verbose=False):
     """Greedy bank search baseline: repeatedly add the (concept, strength)
     pair that most reduces the distance, until improvement saturates."""
     device = h_a.device
     m_total = concept_hidden.size(0)
-    dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a, orth_weight)
+    dist = _distance_fn(distance, h_b.float(), mask_b, h_a, mask_a,
+                        orth_weight, deflate)
 
     d0 = dist(h_a.float(), mask_a).item()
     if d0 < 1e-12:

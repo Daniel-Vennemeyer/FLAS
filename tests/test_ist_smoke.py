@@ -13,7 +13,8 @@ from transformers.models.gemma2 import Gemma2Config
 
 from flas.model import FlowFunction
 from flas.ist.activations import activation_distance, masked_mean
-from flas.ist.inverse import TransportMixture, solve_greedy, solve_sparse
+from flas.ist.inverse import (
+    TransportMixture, generic_direction, solve_greedy, solve_sparse)
 
 torch.manual_seed(0)
 
@@ -119,6 +120,44 @@ def test_sparse_recovery():
         f"top-2 recovered concepts {top2} != planted {true_support}"
 
 
+def test_individual_transports_match_onehot():
+    flow = tiny_flow()
+    mixture = TransportMixture(flow, n_steps=N, concept_chunk=2)
+    h = torch.randn(1, S, D)
+    ch, cm = torch.randn(M, L, D), torch.ones(M, L)
+    states = mixture.individual_transports(h, ch, cm, alpha=1.5)
+    assert states.shape == (M, S, D)
+    for i in (0, 3, M - 1):
+        onehot = torch.zeros(M)
+        onehot[i] = 1.5
+        expected = mixture.transport(h, ch, cm, onehot)
+        assert torch.allclose(states[i:i + 1], expected, atol=1e-4), \
+            f"individual transport {i} != one-hot mixture transport"
+
+
+def test_deflated_recovery_under_generic_confound():
+    """When h_b carries a large component along the bank-mean (generic)
+    steering direction, deflating it must still recover the planted concepts
+    — this is the confound observed on real pairs."""
+    flow = tiny_flow()
+    for p in flow.parameters():
+        p.requires_grad_(False)
+    mixture, h_a, mask, h_b, ch, cm, alphas_true = make_problem(flow)
+    g = generic_direction(mixture, h_a, mask, ch, cm, alpha_ref=1.0)  # [1, d]
+    h_b = h_b + 0.5 * g.unsqueeze(0) * mask.unsqueeze(-1)  # generic offset
+
+    res = solve_sparse(
+        mixture, h_a, mask, h_b, mask, ch, cm,
+        distance="proj", orth_weight=0.1, deflate=g,
+        l1_weight=0.01, iters=250, lr=0.15, alpha_max=4.0,
+        threshold=0.1, seed=0)
+    print(f"  deflated EF={res.explained_fraction:.3f}  support={res.support}")
+    true_support = set(torch.nonzero(alphas_true).flatten().tolist())
+    top2 = set(torch.topk(res.alphas, 2).indices.tolist())
+    assert top2 & true_support, \
+        f"deflated solver found none of the planted concepts (top2={top2})"
+
+
 def test_sparse_recovery_proj():
     """proj distance must also recover a planted transport, including when the
     planted displacement is small relative to an unrelated content offset in
@@ -159,6 +198,8 @@ def test_greedy_recovery():
 if __name__ == "__main__":
     for fn in [test_transport_shapes_and_identity, test_chunking_equivalence,
                test_gradient_flows_to_alphas, test_distances,
+               test_individual_transports_match_onehot,
+               test_deflated_recovery_under_generic_confound,
                test_sparse_recovery, test_sparse_recovery_proj,
                test_greedy_recovery]:
         print(f"{fn.__name__} ...")

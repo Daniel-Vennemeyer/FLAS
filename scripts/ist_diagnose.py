@@ -58,6 +58,7 @@ def main():
     parser.add_argument("--concept-bank", type=str, required=True)
     parser.add_argument("--alphas", type=float, nargs="+", default=[1.0, 2.0, 3.0])
     parser.add_argument("--n-steps", type=int, default=3)
+    parser.add_argument("--concept-chunk", type=int, default=24)
     parser.add_argument("--max-pairs", type=int, default=5)
     parser.add_argument("--max-len", type=int, default=1024)
     parser.add_argument("--output", type=str, default=None)
@@ -68,7 +69,8 @@ def main():
     llm, tokenizer, layer = gen.llm, gen.tokenizer, gen.layer
     prompt_format = getattr(gen, "_prompt_format", "chat")
     flow_fn = gen.flow_fn.float()
-    mixture = TransportMixture(flow_fn, n_steps=args.n_steps)
+    mixture = TransportMixture(flow_fn, n_steps=args.n_steps,
+                               concept_chunk=args.concept_chunk)
 
     bank = load_bank(args.concept_bank)
     enc = tokenizer([b["concept"] for b in bank], return_tensors="pt",
@@ -80,6 +82,7 @@ def main():
     pairs = json.load(open(args.pairs_file))[:args.max_pairs]
     all_rows = []
     true_ranks = []
+    true_ranks_centered = []
 
     for pair in pairs:
         h_a, mask_a, _ = extract_layer_activations(
@@ -102,60 +105,73 @@ def main():
 
         rows = []
         with torch.no_grad():
-            for i, b in enumerate(bank):
-                for alpha in args.alphas:
-                    a_vec = torch.zeros(1, device=h_a.device)
-                    a_vec[0] = alpha
-                    h_t = mixture.transport(
-                        h_a, concept_hidden[i:i + 1], concept_mask[i:i + 1], a_vec)
-                    pool_t = masked_mean(h_t.float(), mask_a)[0]
-                    disp = pool_t - pool_a
-                    cos = float(torch.nn.functional.cosine_similarity(
-                        disp, diff, dim=0))
-                    ratio = float(disp.norm() / diff.norm().clamp(min=1e-8))
-                    proj_frac = float((disp * u).sum() / diff.norm().clamp(min=1e-8))
-                    ef_l2 = float(1 - (pool_t - pool_b).pow(2).sum()
-                                  / diff.pow(2).sum().clamp(min=1e-12))
+            for alpha in args.alphas:
+                states = mixture.individual_transports(
+                    h_a, concept_hidden, concept_mask, alpha)
+                m = mask_a.expand(states.size(0), -1)
+                disp = masked_mean(states.float(), m) - pool_a.unsqueeze(0)  # [M, d]
+                # Centered displacement: subtract the bank-mean (generic)
+                # component so concepts are compared on what distinguishes them.
+                cdisp = disp - disp.mean(dim=0, keepdim=True)
+                for i, b in enumerate(bank):
+                    d_i, cd_i = disp[i], cdisp[i]
+                    pool_t = pool_a + d_i
                     rows.append({
                         "pair_id": pair.get("pair_id"),
                         "concept_id": b["concept_id"], "concept": b["concept"],
                         "is_true": b["concept_id"] in true_ids,
-                        "alpha": alpha, "cos": cos, "ratio": ratio,
-                        "proj_frac": proj_frac, "ef_l2": ef_l2,
+                        "alpha": alpha,
+                        "cos": float(torch.nn.functional.cosine_similarity(
+                            d_i, diff, dim=0)),
+                        "ccos": float(torch.nn.functional.cosine_similarity(
+                            cd_i, diff, dim=0)),
+                        "ratio": float(d_i.norm() / diff.norm().clamp(min=1e-8)),
+                        "proj_frac": float((d_i * u).sum()
+                                           / diff.norm().clamp(min=1e-8)),
+                        "ef_l2": float(1 - (pool_t - pool_b).pow(2).sum()
+                                       / diff.pow(2).sum().clamp(min=1e-12)),
                     })
         all_rows.extend(rows)
 
-        # Rank concepts by their best cosine over the probed alphas.
-        best_by_concept = {}
-        for r in rows:
-            k = r["concept_id"]
-            if k not in best_by_concept or r["cos"] > best_by_concept[k]["cos"]:
-                best_by_concept[k] = r
-        ranked = sorted(best_by_concept.values(), key=lambda r: -r["cos"])
-        print(f"{'rank':>4} {'cos':>7} {'ratio':>7} {'proj':>7} {'ef_l2':>7}  concept")
-        for rank, r in enumerate(ranked[:8], 1):
-            mark = " <-- TRUE" if r["is_true"] else ""
-            print(f"{rank:>4} {r['cos']:>7.3f} {r['ratio']:>7.2f} "
-                  f"{r['proj_frac']:>7.3f} {r['ef_l2']:>7.3f}  "
-                  f"{r['concept'][:45]}{mark}")
-        for rank, r in enumerate(ranked, 1):
-            if r["is_true"]:
-                true_ranks.append(rank)
-                if rank > 8:
-                    print(f"{rank:>4} {r['cos']:>7.3f} {r['ratio']:>7.2f} "
-                          f"{r['proj_frac']:>7.3f} {r['ef_l2']:>7.3f}  "
-                          f"{r['concept'][:45]} <-- TRUE (below top-8)")
+        # Rank concepts by their best (centered) cosine over the probed alphas.
+        def rank_by(key, ranks_acc):
+            best = {}
+            for r in rows:
+                k = r["concept_id"]
+                if k not in best or r[key] > best[k][key]:
+                    best[k] = r
+            ranked = sorted(best.values(), key=lambda r: -r[key])
+            for rank, r in enumerate(ranked, 1):
+                if r["is_true"]:
+                    ranks_acc.append(rank)
+            return ranked
+
+        ranked_c = rank_by("ccos", true_ranks_centered)
+        rank_by("cos", true_ranks)
+
+        print(f"{'rank':>4} {'ccos':>7} {'cos':>7} {'ratio':>7} {'proj':>7}  concept")
+        for rank, r in enumerate(ranked_c, 1):
+            if rank <= 8 or r["is_true"]:
+                mark = " <-- TRUE" if r["is_true"] else ""
+                extra = " (below top-8)" if rank > 8 else ""
+                print(f"{rank:>4} {r['ccos']:>7.3f} {r['cos']:>7.3f} "
+                      f"{r['ratio']:>7.2f} {r['proj_frac']:>7.3f}  "
+                      f"{r['concept'][:45]}{mark}{extra}")
 
     n_true = len(true_ranks)
     m = len(bank)
     print(f"\n=== Signal summary over {len(pairs)} pairs, {n_true} true edits, "
           f"bank size {m} ===")
     if n_true:
-        tr = np.array(true_ranks)
-        print(f"true-concept rank by cosine: mean {tr.mean():.1f} "
-              f"(random = {(m + 1) / 2:.1f}), median {np.median(tr):.0f}")
-        print(f"top-1 hit rate {np.mean(tr == 1):.2f}   "
-              f"top-3 {np.mean(tr <= 3):.2f}   top-5 {np.mean(tr <= 5):.2f}")
+        for label, ranks in (("raw cosine", true_ranks),
+                             ("CENTERED cosine", true_ranks_centered)):
+            tr = np.array(ranks)
+            print(f"true-concept rank by {label}: mean {tr.mean():.1f} "
+                  f"(random = {(m + 1) / 2:.1f}), median {np.median(tr):.0f}  |  "
+                  f"top-1 {np.mean(tr == 1):.2f}  top-3 {np.mean(tr <= 3):.2f}  "
+                  f"top-5 {np.mean(tr <= 5):.2f}")
+        print("(centered = bank-mean displacement removed; this is what the "
+              "solver's --deflate-generic metric uses)")
     ratios = np.array([r["ratio"] for r in all_rows])
     print(f"displacement/diff ratio: median {np.median(ratios):.2f} "
           f"(>>1 means steering moves far beyond the response gap — "

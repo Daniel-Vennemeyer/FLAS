@@ -35,7 +35,8 @@ import torch
 from flas.generate import load_generator
 from flas.ist.activations import extract_layer_activations
 from flas.ist.inverse import (
-    TransportMixture, solve_greedy, solve_sparse, steered_nll)
+    TransportMixture, generic_direction, solve_greedy, solve_sparse,
+    steered_nll)
 
 
 def load_bank(path):
@@ -112,6 +113,15 @@ def main():
     parser.add_argument("--orth-weight", type=float, default=0.1,
                         help="proj distance: weight on displacement orthogonal "
                              "to the a->b diff (1.0 ~= mean_l2)")
+    parser.add_argument("--deflate-generic",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="proj distance: project the bank-mean steering "
+                             "direction out of the metric, so concepts compete "
+                             "on distinctive components only (FLAS "
+                             "displacements share a large generic component "
+                             "that otherwise dominates ranking)")
+    parser.add_argument("--deflate-alpha", type=float, default=2.0,
+                        help="reference strength for the generic direction")
     parser.add_argument("--n-steps", type=int, default=3,
                         help="Euler steps of the transport mixture")
     parser.add_argument("--l1-weight", type=float, default=0.05)
@@ -158,6 +168,12 @@ def main():
         if "edits" in pair:
             entry["true_edits"] = pair["edits"]
 
+        deflate = None
+        if args.deflate_generic and args.distance == "proj":
+            deflate = generic_direction(
+                mixture, h_a, mask_a, concept_hidden, concept_mask,
+                alpha_ref=args.deflate_alpha)
+
         solutions = {}
         if args.method in ("sparse", "both"):
             per_seed = []
@@ -168,7 +184,7 @@ def main():
                     distance=args.distance, l1_weight=args.l1_weight,
                     iters=args.iters, lr=args.lr, alpha_max=args.alpha_max,
                     threshold=args.threshold, seed=seed,
-                    orth_weight=args.orth_weight)
+                    orth_weight=args.orth_weight, deflate=deflate)
                 per_seed.append(res)
             canonical = per_seed[0]
             stability = None
@@ -181,7 +197,7 @@ def main():
             res = solve_greedy(
                 mixture, h_a, mask_a, h_b, mask_b,
                 concept_hidden, concept_mask, distance=args.distance,
-                orth_weight=args.orth_weight)
+                orth_weight=args.orth_weight, deflate=deflate)
             solutions["greedy"] = (res, None)
 
         for name, (res, stability) in solutions.items():
