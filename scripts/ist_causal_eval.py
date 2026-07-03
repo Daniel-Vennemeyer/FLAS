@@ -57,6 +57,19 @@ def main():
     parser.add_argument("--method", choices=["sparse", "greedy", "nll"],
                         default="sparse")
     parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--alpha-min", type=float, default=0.0,
+                        help="drop explanation concepts below this strength "
+                             "before generating/judging (trace-level alphas "
+                             "have no judge-visible steering effect and "
+                             "dilute movement agreement toward chance)")
+    parser.add_argument("--alpha-scale", type=float, default=1.0,
+                        help="multiply inferred alphas at generation time. "
+                             "NLL-calibrated alphas can sit below the "
+                             "strength needed for judge-visible effects in "
+                             "free generation; if agreement holds and "
+                             "movement grows with the scale, the inferred "
+                             "strengths are relatively correct with a "
+                             "different likelihood->generation gain")
     parser.add_argument("--n-steps", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -71,11 +84,20 @@ def main():
     data = json.load(open(args.explanations_file))
     pairs_meta = {p["pair_id"]: p for p in json.load(
         open(data["config"]["pairs_file"]))}
-    pairs = [p for p in data["pairs"]
-             if args.method in p and p[args.method]["explanation"]]
+    pairs = []
+    for p in data["pairs"]:
+        if args.method not in p:
+            continue
+        kept = [e for e in p[args.method]["explanation"]
+                if e["alpha"] >= args.alpha_min]
+        if kept:
+            p = dict(p)
+            p[args.method] = dict(p[args.method], explanation=kept)
+            pairs.append(p)
     if args.max_pairs:
         pairs = pairs[:args.max_pairs]
-    print(f"{len(pairs)} pairs with non-empty {args.method} explanations")
+    print(f"{len(pairs)} pairs with {args.method} explanations at "
+          f"alpha >= {args.alpha_min} (generation alphas x{args.alpha_scale})")
 
     gen = load_mixture_generator(args.flow_ckpt, model_id=args.model_id,
                                  layer=args.layer, num_blocks=args.num_blocks)
@@ -86,7 +108,7 @@ def main():
         meta = pairs_meta[p["pair_id"]]
         explanation = p[args.method]["explanation"]
         concepts = [e["concept"] for e in explanation]
-        alphas = [e["alpha"] for e in explanation]
+        alphas = [e["alpha"] * args.alpha_scale for e in explanation]
 
         outs = gen.generate_mixture(
             [meta["prompt"]] * args.generations_per_pair,
